@@ -1,9 +1,13 @@
 # skyline_app.py – Streamlit UI for SkyLine‑Delay Predictor
 # -----------------------------------------------------------
-# * Searches recursively for all nine CSV files (pattern `*-*2024.csv`)
-#   anywhere inside the project directory, so you can keep them either
-#   in `data/` **or** the repo root.
-# * Builds a Linear Regression model to predict **dep_delay** (minutes).
+# Predict departure delays for AA, B6, DL flights from NYC airports.
+#
+# * Recursively ingests all nine CSVs matching `*-*2024.csv` anywhere in the
+#   repo.
+# * Builds a Linear Regression on carrier/airport one‑hots, day_of_year,
+#   and five delay‑component columns.
+# * Allows selecting any flight date (past or future) — we removed the upper
+#   bound so you can forecast beyond the training year.
 #
 # Run:
 #   pip install streamlit pandas scikit-learn
@@ -21,8 +25,7 @@ from sklearn.linear_model import LinearRegression
 ###############################################################################
 # 1. CONSTANTS
 ###############################################################################
-# Accept both root‑level CSVs *and* files inside ./data/
-CSV_GLOB_PATTERN = "**/*-*2024.csv"  # recursive search
+CSV_GLOB_PATTERN = "**/*-*2024.csv"  # search everywhere
 
 COLS = [
     "carrier", "date", "flight_num", "tail_num", "dest", "crs_dep_time",
@@ -35,40 +38,37 @@ COLS = [
 ###############################################################################
 @st.cache_data(show_spinner=True)
 def load_and_merge() -> pd.DataFrame:
-    """Load every `*-*2024.csv` found under the current working directory."""
     frames = []
     for fp in glob.glob(CSV_GLOB_PATTERN, recursive=True):
-        # Skip non‑CSV that match pattern accidentally
         if not fp.lower().endswith(".csv"):
             continue
         df = pd.read_csv(fp, header=None, names=COLS, dtype=str)
-        airport_code = Path(fp).stem.split("-")[1][:3]
-        df["airport"] = airport_code
+        df["airport"] = Path(fp).stem.split("-")[1][:3]
         frames.append(df)
 
     if not frames:
-        st.error(
-            "No CSV files matching pattern `*-*2024.csv` were found. "
-            "Ensure the nine datasets (e.g., `AA-EWR2024.csv`) are either in the "
-            "project root or a `data/` sub‑directory.")
+        st.error("No CSV files like `AA-EWR2024.csv` found in project.")
         st.stop()
 
     data = pd.concat(frames, ignore_index=True)
 
-    # Parse and clean
-    data["date"] = pd.to_datetime(data["date"], format="%m/%d/%Y")
+    # Clean & parse
+    data["date"] = pd.to_datetime(data["date"], format="%m/%d/%Y", errors="coerce")
+    data = data.dropna(subset=["date"])
+
     num_cols = ["dep_delay", "carrier_delay", "weather_delay", "nas_delay",
                 "security_delay", "late_aircraft_delay"]
     data[num_cols] = data[num_cols].apply(pd.to_numeric, errors="coerce")
-    data["day_of_year"] = data["date"].dt.dayofyear
+    data = data.dropna(subset=["dep_delay"])
 
-    return data.dropna(subset=["dep_delay"])
+    data["day_of_year"] = data["date"].dt.dayofyear
+    return data
 
 
 data = load_and_merge()
 
 ###############################################################################
-# 3. MODEL TRAINING (cached)
+# 3. MODEL TRAINING
 ###############################################################################
 @st.cache_resource(show_spinner=False)
 def train_model(df: pd.DataFrame):
@@ -77,7 +77,6 @@ def train_model(df: pd.DataFrame):
                 "security_delay", "late_aircraft_delay"]]
     X = pd.concat([X_cat, X_num], axis=1)
     y = df["dep_delay"]
-
     model = LinearRegression().fit(X, y)
     return model, X.columns.tolist()
 
@@ -109,10 +108,10 @@ with left:
 with right:
     airport = st.selectbox("Airport", sorted(data.airport.unique()))
 
-date_choice = st.date_input(
-    "Flight Date", dt.date.today(),
-    min_value=data.date.min().date(),
-    max_value=data.date.max().date())
+# Allow any date the user wants (no upper bound)
+min_dt = data.date.min().date()
+
+date_choice = st.date_input("Flight Date", value=dt.date.today(), min_value=min_dt)
 
 defaults = typical_components(data, airline, airport)
 
@@ -140,4 +139,4 @@ if st.button("Predict Delay"):
     delay_pred = model.predict(X_pred)[0]
 
     st.metric("Predicted Departure Delay", f"{delay_pred:.1f} minutes")
-    st.caption("Linear regression trained on 2024 NYC flight data.")
+    st.caption("Linear regression trained on 2024 data; future dates use historical patterns via day‑of‑year feature.")
